@@ -54,9 +54,9 @@ AgentTrade creates a **CRE workflow that reads Chainlink Data Feeds**, runs mult
 
 CRE is the **core orchestration layer** that makes this system work:
 
-1. **Cron Trigger** (`src/workflow/index.ts` [L283-288](src/workflow/index.ts)): Schedules price checks every 5 minutes across the DON
-2. **EVM Client + callContract** (`src/workflow/index.ts` [L176-199](src/workflow/index.ts)): Reads ETH/USD and BTC/USD prices directly from Chainlink Data Feeds on Sepolia using `evmClient.callContract()` with ABI-encoded `latestRoundData()` calls
-3. **HTTP Trigger** (`src/workflow/index.ts` [L245-278](src/workflow/index.ts)): Allows AI agents to request on-demand signals, enabling the x402 payment integration
+1. **Cron Trigger** (`src/workflow/index.ts` [L424](src/workflow/index.ts)): Schedules price checks every 5 minutes across the DON
+2. **EVM Client + callContract** (`src/workflow/index.ts` [L237-265](src/workflow/index.ts)): Reads ETH/USD and BTC/USD prices directly from Chainlink Data Feeds on Sepolia using `evmClient.callContract()` with ABI-encoded `latestRoundData()` calls
+3. **HTTP Trigger** (`src/workflow/index.ts` [L349-415](src/workflow/index.ts)): Allows AI agents to request on-demand signals, enabling the x402 payment integration
 4. **Signal Generation**: The workflow runs momentum and mean reversion strategies on verified price data and returns structured trading signals
 
 Without CRE, each AI agent would need its own oracle integration, its own scheduler, and its own price verification. CRE provides the decentralized execution environment that makes the signals trustworthy.
@@ -138,11 +138,13 @@ npm run agent  # Agent will pay for and consume signals
 
 | Component | Usage | Lines |
 |-----------|-------|-------|
-| `CronCapability` | Scheduled price checks every 5 min | L283-285 |
-| `HTTPCapability` | On-demand signal requests from agents | L286-296 |
-| `EVMClient.callContract()` | Read Chainlink Data Feeds on Sepolia | L176-199 |
-| `encodeCallMsg` / `bytesToHex` | ABI encoding for `latestRoundData()` | L182-196 |
-| `Runner` / `cre.handler` | Workflow orchestration | L298-303 |
+| `CronCapability` | Scheduled price checks every 5 min | L424 |
+| `HTTPCapability` | On-demand signal requests from agents | L425-435 |
+| `EVMClient.callContract()` | Read Chainlink Data Feeds on Sepolia | L237-265 |
+| `encodeCallMsg` / `bytesToHex` | ABI encoding for `latestRoundData()` | L247-254 |
+| `Runner` / `cre.handler` | Workflow orchestration | L438-440 |
+| Signal Analysis (exported) | Momentum + Mean Reversion strategies | L74-225 |
+| `aggregateSignals` | Correct per-direction signal aggregation | L191-225 |
 
 ### Chainlink Data Feeds (Sepolia)
 

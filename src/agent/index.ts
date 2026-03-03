@@ -22,18 +22,32 @@ interface TradingSignal {
   currentPrice: number;
 }
 
+interface Position {
+  amount: number;
+  avgPrice: number;
+}
+
+interface Trade {
+  timestamp: number;
+  action: "BUY" | "SELL";
+  asset: string;
+  amount: number;
+  price: number;
+  reason: string;
+}
+
 interface Portfolio {
   cash: number;
-  positions: Map<string, { amount: number; avgPrice: number }>;
-  trades: Array<{
-    timestamp: number;
-    action: "BUY" | "SELL";
-    asset: string;
-    amount: number;
-    price: number;
-    reason: string;
-  }>;
+  positions: Map<string, Position>;
+  trades: Trade[];
 }
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/** Amounts below this are treated as zero (avoids float dust) */
+const EPSILON = 1e-10;
 
 // ============================================================================
 // AI Trading Agent
@@ -41,10 +55,10 @@ interface Portfolio {
 
 export class AgentTradeAI {
   private portfolio: Portfolio;
-  private initialCash: number;
-  private minTradeSize: number;
-  private maxTradeSize: number;
-  private riskTolerance: number;
+  private readonly initialCash: number;
+  private readonly minTradeSize: number;
+  private readonly maxTradeSize: number;
+  private readonly riskTolerance: number;
 
   constructor(
     initialCash: number = 10000,
@@ -52,19 +66,32 @@ export class AgentTradeAI {
     maxTradeSize: number = 1.0,
     riskTolerance: number = 0.02
   ) {
+    if (initialCash <= 0) throw new Error("initialCash must be positive");
+    if (minTradeSize <= 0) throw new Error("minTradeSize must be positive");
+    if (maxTradeSize <= 0 || maxTradeSize < minTradeSize) {
+      throw new Error("maxTradeSize must be >= minTradeSize");
+    }
+    if (riskTolerance < 0 || riskTolerance >= 1) {
+      throw new Error("riskTolerance must be in [0, 1)");
+    }
+
     this.initialCash = initialCash;
+    this.minTradeSize = minTradeSize;
+    this.maxTradeSize = maxTradeSize;
+    this.riskTolerance = riskTolerance;
     this.portfolio = {
       cash: initialCash,
       positions: new Map(),
       trades: [],
     };
-    this.minTradeSize = minTradeSize;
-    this.maxTradeSize = maxTradeSize;
-    this.riskTolerance = riskTolerance;
   }
 
   /**
-   * Analyze signals from CRE workflow and make trading decision
+   * Analyze signals from CRE workflow and make trading decisions.
+   *
+   * FIX: Signal strength is now calculated only from signals that match
+   * the direction (BUY signals for buyStrength, SELL for sellStrength).
+   * Previously divided by total signal count, which diluted everything.
    */
   analyzeSignals(signals: TradingSignal[]): {
     action: "BUY" | "SELL" | "HOLD";
@@ -73,7 +100,6 @@ export class AgentTradeAI {
     confidence: number;
     reasoning: string;
   }[] {
-    // Group signals by asset
     const byAsset = new Map<string, TradingSignal[]>();
     for (const signal of signals) {
       const existing = byAsset.get(signal.asset) || [];
@@ -84,28 +110,35 @@ export class AgentTradeAI {
     const decisions = [];
 
     for (const [asset, assetSignals] of byAsset) {
-      let buyStrength = 0;
-      let sellStrength = 0;
+      const buySignals = assetSignals.filter((s) => s.signal === "BUY");
+      const sellSignals = assetSignals.filter((s) => s.signal === "SELL");
       const reasons: string[] = [];
 
-      for (const signal of assetSignals) {
-        if (signal.signal === "BUY") {
-          buyStrength += signal.strength;
-          reasons.push(`${signal.type}: ${signal.reason}`);
-        } else if (signal.signal === "SELL") {
-          sellStrength += signal.strength;
-          reasons.push(`${signal.type}: ${signal.reason}`);
-        }
+      // Average strength among matching signals only (not all signals)
+      const buyStrength =
+        buySignals.length > 0
+          ? buySignals.reduce((sum, s) => sum + s.strength, 0) / buySignals.length
+          : 0;
+      const sellStrength =
+        sellSignals.length > 0
+          ? sellSignals.reduce((sum, s) => sum + s.strength, 0) / sellSignals.length
+          : 0;
+
+      for (const s of [...buySignals, ...sellSignals]) {
+        reasons.push(`${s.type}: ${s.reason}`);
       }
 
-      buyStrength /= assetSignals.length;
-      sellStrength /= assetSignals.length;
-
       const netStrength = buyStrength - sellStrength;
-      const minConfidence = 0.3;
+      // With opposing strategies (momentum vs mean reversion), they rarely agree.
+      // 0.2 = trade when one signal is significantly stronger.
+      const minConfidence = 0.2;
 
       if (netStrength > minConfidence) {
-        const amount = this.calculatePositionSize(buyStrength);
+        // Position size as fraction of available cash, converted to units at current price
+        const fraction = this.calculatePositionSize(buyStrength);
+        const currentPrice = assetSignals[0]?.currentPrice || 0;
+        const dollarAmount = this.portfolio.cash * fraction;
+        const amount = currentPrice > 0 ? dollarAmount / currentPrice : 0;
         decisions.push({
           action: "BUY" as const,
           asset,
@@ -114,7 +147,9 @@ export class AgentTradeAI {
           reasoning: `Consensus BUY (${(buyStrength * 100).toFixed(1)}%): ${reasons.join("; ")}`,
         });
       } else if (netStrength < -minConfidence) {
-        const amount = this.calculatePositionSize(sellStrength);
+        const position = this.portfolio.positions.get(asset);
+        const fraction = this.calculatePositionSize(sellStrength);
+        const amount = position ? position.amount * fraction : 0;
         decisions.push({
           action: "SELL" as const,
           asset,
@@ -155,30 +190,36 @@ export class AgentTradeAI {
     price: number,
     reason: string
   ): boolean {
+    if (amount <= 0 || price <= 0) return false;
+
     const cost = amount * price;
 
     if (action === "BUY") {
       if (this.portfolio.cash < cost) {
-        console.log(`❌ Insufficient cash for BUY ${amount} ${asset}`);
+        console.log(`Insufficient cash for BUY ${amount} ${asset}`);
         return false;
       }
       this.portfolio.cash -= cost;
       const position = this.portfolio.positions.get(asset) || { amount: 0, avgPrice: 0 };
       const totalAmount = position.amount + amount;
-      position.avgPrice = (position.avgPrice * position.amount + price * amount) / totalAmount;
+      position.avgPrice =
+        totalAmount > EPSILON
+          ? (position.avgPrice * position.amount + price * amount) / totalAmount
+          : 0;
       position.amount = totalAmount;
       this.portfolio.positions.set(asset, position);
-      console.log(`✅ BUY ${amount.toFixed(4)} ${asset} @ $${price.toFixed(2)}`);
     } else {
       const position = this.portfolio.positions.get(asset);
-      if (!position || position.amount < amount) {
-        console.log(`❌ Insufficient ${asset} for SELL`);
+      if (!position || position.amount < amount - EPSILON) {
+        console.log(`Insufficient ${asset} for SELL`);
         return false;
       }
       this.portfolio.cash += cost;
       position.amount -= amount;
-      if (position.amount === 0) this.portfolio.positions.delete(asset);
-      console.log(`✅ SELL ${amount.toFixed(4)} ${asset} @ $${price.toFixed(2)}`);
+      // Use epsilon comparison instead of === 0 to avoid float dust
+      if (position.amount < EPSILON) {
+        this.portfolio.positions.delete(asset);
+      }
     }
 
     this.portfolio.trades.push({
@@ -224,36 +265,34 @@ export class AgentTradeAI {
 // ============================================================================
 
 async function demo() {
-  console.log("═══════════════════════════════════════════════════════");
-  console.log("  AgentTrade AI - x402 Signal Consumer Demo");
-  console.log("═══════════════════════════════════════════════════════\n");
+  console.log("AgentTrade AI - x402 Signal Consumer Demo\n");
 
   const agent = new AgentTradeAI(10000);
 
-  // Simulate fetching signals from x402 gateway
-  const GATEWAY_URL = (globalThis as any).process?.env?.GATEWAY_URL || "http://localhost:3000";
+  const GATEWAY_URL = process.env.GATEWAY_URL || "http://localhost:3000";
 
   console.log(`Fetching signals from ${GATEWAY_URL}/signals...\n`);
 
   try {
     const response = await fetch(`${GATEWAY_URL}/signals`, {
       headers: {
-        // In production, x402-fetch would auto-add payment header
         "x-payment": "demo-payment-header",
       },
     });
 
     if (response.status === 402) {
-      console.log("💰 Server requires x402 payment ($0.01 USDC)");
-      console.log("   In production, x402-fetch handles this automatically.\n");
-      // Fall through to demo with mock data
+      console.log("Server requires x402 payment ($0.01 USDC)");
+      console.log("In production, x402-fetch handles this automatically.\n");
     }
 
     if (response.ok) {
-      const data = await response.json();
-      console.log("📊 Received signals from CRE workflow:");
-      console.log(`   Prices: ETH=$${data.prices?.ETH}, BTC=$${data.prices?.BTC}`);
-      console.log(`   Signals: ${data.signals?.length} signals\n`);
+      const data = (await response.json()) as {
+        prices: Record<string, number>;
+        signals: TradingSignal[];
+      };
+      console.log("Received signals from CRE workflow:");
+      console.log(`  Prices: ETH=$${data.prices?.ETH}, BTC=$${data.prices?.BTC}`);
+      console.log(`  Signals: ${data.signals?.length} signals\n`);
 
       if (data.signals) {
         const decisions = agent.analyzeSignals(data.signals);
@@ -270,11 +309,11 @@ async function demo() {
         }
       }
 
-      console.log("\n📋 Portfolio:", JSON.stringify(agent.getPortfolioSummary(), null, 2));
+      console.log("\nPortfolio:", JSON.stringify(agent.getPortfolioSummary(), null, 2));
       return;
     }
-  } catch (e) {
-    console.log("⚠️  Could not reach gateway server. Running with mock data.\n");
+  } catch {
+    console.log("Could not reach gateway server. Running with mock data.\n");
   }
 
   // Fallback: demo with mock signals
@@ -301,8 +340,15 @@ async function demo() {
     }
   }
 
-  console.log("\n📋 Portfolio:", JSON.stringify(agent.getPortfolioSummary(), null, 2));
+  console.log("\nPortfolio:", JSON.stringify(agent.getPortfolioSummary(), null, 2));
 }
 
-// Run demo if executed directly
-demo().catch(console.error);
+// Only run demo when executed directly
+const isDirectRun =
+  typeof process !== "undefined" &&
+  process.argv[1] &&
+  (process.argv[1].includes("agent") || process.argv[1].includes("index"));
+
+if (isDirectRun && !process.argv[1]?.includes("vitest") && !process.argv[1]?.includes("test")) {
+  demo().catch(console.error);
+}

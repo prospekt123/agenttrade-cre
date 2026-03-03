@@ -4,21 +4,12 @@
  * Exposes AI trading signals behind x402 micropayment paywall.
  * AI agents pay $0.01 USDC per signal request, then receive
  * Chainlink-verified price data + trading recommendations.
- *
- * Flow:
- * 1. AI Agent sends request to /signals endpoint
- * 2. x402 middleware requires $0.01 USDC payment
- * 3. Agent's x402-enabled client auto-pays
- * 4. Server triggers CRE workflow (or returns cached signals)
- * 5. Agent receives trading signals to act on
- *
- * This demonstrates "AI agents consuming CRE workflows with x402 payments"
- * - the exact use case highlighted in the CRE & AI hackathon track.
  */
 
 import express from "express";
 import cors from "cors";
 import { AgentTradeAI } from "../../src/agent/index.js";
+import { aggregateSignals, type TradingSignal } from "../../src/workflow/index.js";
 
 const app = express();
 app.use(cors());
@@ -30,22 +21,28 @@ const PORT = Number(process.env.PORT ?? 3000);
 const X402_RECEIVER = process.env.X402_RECEIVER_ADDRESS || "0x0000000000000000000000000000000000000000";
 const X402_FACILITATOR = process.env.X402_FACILITATOR_URL || "https://x402.org/facilitator";
 
+// Internal API key for signal updates (set via env, required in production)
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || "";
+
 // ============================================================================
-// x402 Payment Middleware (simplified for demo/simulation)
-// In production, use x402-express paymentMiddleware
+// x402 Payment Middleware
 // ============================================================================
 
 /**
- * Simplified x402 middleware for demonstration.
- * In a production deployment, replace with:
- *   import { paymentMiddleware } from "x402-express";
- *   app.use(paymentMiddleware(payToAddress, routes, { url: facilitatorUrl }));
+ * x402 middleware for signal endpoint.
+ * In production: replace with `x402-express` paymentMiddleware.
+ * Demo mode: validates payment header exists and is non-empty.
  */
 const x402Middleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  // Only apply to paid endpoints
+  if (req.path !== "/signals") {
+    return next();
+  }
+
   const paymentHeader = req.headers["x-payment"];
 
-  if (!paymentHeader && req.path === "/signals") {
-    // Return 402 Payment Required with payment details
+  if (!paymentHeader || (typeof paymentHeader === "string" && paymentHeader.trim() === "")) {
+    // Return 402 Payment Required with x402 payment details
     return res.status(402).json({
       error: "Payment Required",
       x402: {
@@ -60,12 +57,10 @@ const x402Middleware = (req: express.Request, res: express.Response, next: expre
     });
   }
 
-  if (paymentHeader) {
-    console.log("  [x402] Payment header received - validating...");
-    // In production: validate via facilitator
-    // For demo: accept any payment header
-    console.log("  [x402] Payment accepted");
-  }
+  // TODO: In production, validate payment via facilitator:
+  // const valid = await fetch(X402_FACILITATOR + "/verify", { body: paymentHeader });
+  // For now: accept non-empty payment headers in demo mode
+  console.log("  [x402] Payment header received - demo mode (accepting)");
 
   next();
 };
@@ -73,156 +68,102 @@ const x402Middleware = (req: express.Request, res: express.Response, next: expre
 app.use(x402Middleware);
 
 // ============================================================================
-// Trading Signal Cache (populated by CRE workflow simulation)
+// Trading Signal Cache (populated by CRE workflow)
 // ============================================================================
 
 interface CachedSignals {
   timestamp: number;
   prices: Record<string, number>;
-  signals: Array<{
-    type: string;
-    asset: string;
-    signal: "BUY" | "SELL" | "HOLD";
-    strength: number;
-    reason: string;
-    currentPrice: number;
+  signals: TradingSignal[];
+  aggregated: Record<string, {
+    buyStrength: number;
+    sellStrength: number;
+    recommendation: string;
   }>;
-  aggregated: Record<
-    string,
-    {
-      buyStrength: number;
-      sellStrength: number;
-      recommendation: string;
-    }
-  >;
 }
 
 let cachedSignals: CachedSignals | null = null;
-
-// ============================================================================
-// AI Agent Instance
-// ============================================================================
-
-const agent = new AgentTradeAI(10000, 0.01, 1.0, 0.02);
 
 // ============================================================================
 // API Endpoints
 // ============================================================================
 
 /**
- * GET /signals
- * Returns current AI trading signals (requires x402 payment)
- *
- * This is the primary endpoint consumed by AI agents.
- * Payment: $0.01 USDC via x402 protocol
+ * GET /signals - Returns current AI trading signals (requires x402 payment)
  */
 app.get("/signals", (_req, res) => {
-  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log("GET /signals (x402 paid request)");
 
   if (!cachedSignals) {
     return res.status(503).json({
       error: "No signals available yet. CRE workflow has not generated data.",
-      hint: "Run: cre workflow simulate to generate signals",
+      hint: "POST to /signals/update with workflow output, or run: cre workflow simulate",
     });
   }
 
-  // Run AI agent analysis on the signals
-  const aiDecision = analyzeWithAgent(cachedSignals);
+  // Re-aggregate using the corrected aggregation logic
+  const freshAggregated = aggregateSignals(cachedSignals.signals);
 
   const response = {
-    ...cachedSignals,
-    aiRecommendation: aiDecision,
+    timestamp: cachedSignals.timestamp,
+    prices: cachedSignals.prices,
+    signals: cachedSignals.signals,
+    aggregated: freshAggregated,
     metadata: {
       source: "Chainlink CRE Workflow",
-      dataFeeds: ["ETH/USD", "BTC/USD"],
+      dataFeeds: Object.keys(cachedSignals.prices).map((a) => `${a}/USD`),
       network: "Sepolia Testnet",
       strategies: ["momentum", "meanReversion"],
       paymentRequired: "$0.01 USDC via x402",
     },
   };
 
-  console.log("  Returning signals to agent");
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
-
   res.json(response);
 });
 
 /**
- * POST /signals/update
- * Updates cached signals (called after CRE workflow execution)
- * Internal endpoint - no x402 payment required
+ * POST /signals/update - Updates cached signals (internal, authenticated)
  */
 app.post("/signals/update", (req, res) => {
-  console.log("\n  [Signal Update] Received new signals from CRE workflow");
-  cachedSignals = req.body;
+  // Require API key in production mode
+  if (INTERNAL_API_KEY) {
+    const provided = req.headers["x-api-key"];
+    if (provided !== INTERNAL_API_KEY) {
+      return res.status(403).json({ error: "Invalid API key" });
+    }
+  }
+
+  const body = req.body;
+  if (!body || !body.prices || !body.signals) {
+    return res.status(400).json({ error: "Missing required fields: prices, signals" });
+  }
+
+  cachedSignals = body;
+  console.log("[Signal Update] Received new signals from CRE workflow");
   res.json({ ok: true, timestamp: cachedSignals?.timestamp });
 });
 
 /**
- * GET /health
- * Health check endpoint
+ * GET /health - Health check
  */
 app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     hasSignals: !!cachedSignals,
     lastUpdate: cachedSignals?.timestamp || null,
+    uptime: process.uptime(),
   });
 });
-
-// ============================================================================
-// AI Agent Analysis
-// ============================================================================
-
-function analyzeWithAgent(signals: CachedSignals) {
-  const results: Record<string, any> = {};
-
-  for (const [asset, agg] of Object.entries(signals.aggregated)) {
-    const assetSignals = signals.signals
-      .filter((s) => s.asset === asset)
-      .map((s) => ({
-        type: s.type,
-        signal: s.signal as "BUY" | "SELL" | "HOLD",
-        strength: s.strength,
-        reason: s.reason,
-        currentPrice: s.currentPrice,
-      }));
-
-    // Aggregate signal strengths
-    let buyStrength = 0;
-    let sellStrength = 0;
-    for (const s of assetSignals) {
-      if (s.signal === "BUY") buyStrength += s.strength;
-      if (s.signal === "SELL") sellStrength += s.strength;
-    }
-    buyStrength /= assetSignals.length;
-    sellStrength /= assetSignals.length;
-
-    const netStrength = buyStrength - sellStrength;
-    const confidence = Math.abs(netStrength);
-
-    results[asset] = {
-      action: netStrength > 0.3 ? "BUY" : netStrength < -0.3 ? "SELL" : "HOLD",
-      confidence: (confidence * 100).toFixed(1) + "%",
-      suggestedSize: Math.max(0.01, Math.min(1.0, confidence * 0.98)).toFixed(4),
-      reasoning: assetSignals.map((s) => `${s.type}: ${s.reason}`).join("; "),
-    };
-  }
-
-  return results;
-}
 
 // ============================================================================
 // Start Server
 // ============================================================================
 
-app.listen(PORT, () => {
-  console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  console.log("AgentTrade x402 Gateway");
-  console.log(`  http://localhost:${PORT}`);
-  console.log("  GET  /signals  (x402 paid - $0.01 USDC)");
-  console.log("  POST /signals/update  (internal)");
-  console.log("  GET  /health");
-  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+const server = app.listen(PORT, () => {
+  console.log(`AgentTrade x402 Gateway running on http://localhost:${PORT}`);
+  console.log(`  GET  /signals        (x402 paid - $0.01 USDC)`);
+  console.log(`  POST /signals/update (internal${INTERNAL_API_KEY ? ", key required" : ", NO AUTH - set INTERNAL_API_KEY"})`);
+  console.log(`  GET  /health`);
 });
+
+export { app, server };

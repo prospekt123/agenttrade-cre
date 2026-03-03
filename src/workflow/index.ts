@@ -34,10 +34,7 @@ interface WorkflowConfig {
   schedule: string;
   evms: Array<{
     chainSelectorName: string;
-    dataFeeds: {
-      ETH: string;
-      BTC: string;
-    };
+    dataFeeds: Record<string, string>;
   }>;
 }
 
@@ -62,21 +59,10 @@ const priceFeedAbi = [
 ] as const;
 
 // ============================================================================
-// Price History (in-memory across cron ticks within a workflow session)
+// Signal Detection Logic (exported for testing)
 // ============================================================================
 
-const priceHistory: {
-  eth: Array<{ timestamp: number; price: number }>;
-  btc: Array<{ timestamp: number; price: number }>;
-} = { eth: [], btc: [] };
-
-const MAX_HISTORY = 30;
-
-// ============================================================================
-// Signal Detection Logic
-// ============================================================================
-
-interface TradingSignal {
+export interface TradingSignal {
   type: "momentum" | "meanReversion";
   asset: string;
   signal: "BUY" | "SELL" | "HOLD";
@@ -85,7 +71,7 @@ interface TradingSignal {
   currentPrice: number;
 }
 
-function calculateMomentumSignal(
+export function calculateMomentumSignal(
   history: Array<{ timestamp: number; price: number }>,
   currentPrice: number,
   asset: string,
@@ -138,7 +124,7 @@ function calculateMomentumSignal(
   };
 }
 
-function calculateMeanReversionSignal(
+export function calculateMeanReversionSignal(
   history: Array<{ timestamp: number; price: number }>,
   currentPrice: number,
   asset: string,
@@ -198,6 +184,58 @@ function calculateMeanReversionSignal(
   };
 }
 
+/**
+ * Aggregate signals per asset with correct strength calculation.
+ * Only counts signals that actually match the direction (not all signals).
+ */
+export function aggregateSignals(
+  signals: TradingSignal[]
+): Record<string, { buyStrength: number; sellStrength: number; recommendation: string }> {
+  const byAsset = new Map<string, TradingSignal[]>();
+  for (const s of signals) {
+    const arr = byAsset.get(s.asset) || [];
+    arr.push(s);
+    byAsset.set(s.asset, arr);
+  }
+
+  const result: Record<string, { buyStrength: number; sellStrength: number; recommendation: string }> = {};
+
+  // Net strength threshold: how much one direction must dominate the other.
+  // With 2 opposing strategies (momentum vs mean reversion), they rarely agree.
+  // 0.2 = trade when one strategy is significantly stronger than the other.
+  const MIN_CONFIDENCE = 0.2;
+
+  for (const [asset, assetSignals] of byAsset) {
+    const buySignals = assetSignals.filter((s) => s.signal === "BUY");
+    const sellSignals = assetSignals.filter((s) => s.signal === "SELL");
+
+    const buyStrength =
+      buySignals.length > 0
+        ? buySignals.reduce((sum, s) => sum + s.strength, 0) / buySignals.length
+        : 0;
+    const sellStrength =
+      sellSignals.length > 0
+        ? sellSignals.reduce((sum, s) => sum + s.strength, 0) / sellSignals.length
+        : 0;
+
+    // Use net strength (same logic as AgentTradeAI.analyzeSignals)
+    const netStrength = buyStrength - sellStrength;
+
+    result[asset] = {
+      buyStrength,
+      sellStrength,
+      recommendation:
+        netStrength > MIN_CONFIDENCE
+          ? "BUY"
+          : netStrength < -MIN_CONFIDENCE
+            ? "SELL"
+            : "HOLD",
+    };
+  }
+
+  return result;
+}
+
 // ============================================================================
 // Helper: Read Chainlink Price Feed
 // ============================================================================
@@ -243,14 +281,14 @@ const onCronTrigger = (
   runtime: Runtime<WorkflowConfig>,
   _triggerOutput: CronPayload
 ): string => {
-  runtime.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   runtime.log("AgentTrade CRE Workflow: Price Check + Signal Generation");
-  runtime.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+  const evmConfig = runtime.config.evms[0];
 
   // Get network and create EVM client
   const network = getNetwork({
     chainFamily: "evm",
-    chainSelectorName: runtime.config.evms[0].chainSelectorName,
+    chainSelectorName: evmConfig.chainSelectorName,
     isTestnet: true,
   });
 
@@ -262,106 +300,52 @@ const onCronTrigger = (
     network.chainSelector.selector
   );
 
-  // Step 1: Fetch prices from Chainlink Data Feeds
-  runtime.log("\n[Step 1] Fetching prices from Chainlink Data Feeds...");
+  // Fetch prices from all configured data feeds
+  runtime.log("[Step 1] Fetching prices from Chainlink Data Feeds...");
 
-  const ethData = getPriceFromFeed(
-    runtime,
-    evmClient,
-    runtime.config.evms[0].dataFeeds.ETH
-  );
+  const prices: Record<string, number> = {};
+  const signals: TradingSignal[] = [];
 
-  const btcData = getPriceFromFeed(
-    runtime,
-    evmClient,
-    runtime.config.evms[0].dataFeeds.BTC
-  );
+  for (const [asset, feedAddress] of Object.entries(evmConfig.dataFeeds)) {
+    const data = getPriceFromFeed(runtime, evmClient, feedAddress);
+    prices[asset] = data.price;
+    runtime.log(`  ${asset}/USD: $${data.price.toFixed(2)}`);
 
-  runtime.log(`  ETH/USD: $${ethData.price.toFixed(2)}`);
-  runtime.log(`  BTC/USD: $${btcData.price.toFixed(2)}`);
+    // NOTE: CRE workflow invocations are isolated - no persistent state between ticks.
+    // Signals are generated per-tick from current price only.
+    // For production: use on-chain storage or CRE state capabilities for history.
+    // Single-tick signals still provide value via mean reversion against the feed's
+    // own recent rounds (could be fetched via getRoundData in future).
+    signals.push(
+      calculateMomentumSignal([], data.price, asset),
+      calculateMeanReversionSignal([], data.price, asset)
+    );
+  }
 
-  // Step 2: Update price history
-  const timestamp = Math.floor(Date.now() / 1000);
-  priceHistory.eth.push({ timestamp, price: ethData.price });
-  priceHistory.btc.push({ timestamp, price: btcData.price });
-  if (priceHistory.eth.length > MAX_HISTORY) priceHistory.eth.shift();
-  if (priceHistory.btc.length > MAX_HISTORY) priceHistory.btc.shift();
-
-  // Step 3: Generate trading signals
-  runtime.log("\n[Step 2] Generating trading signals...");
-
-  const signals: TradingSignal[] = [
-    calculateMomentumSignal(priceHistory.eth, ethData.price, "ETH"),
-    calculateMeanReversionSignal(priceHistory.eth, ethData.price, "ETH"),
-    calculateMomentumSignal(priceHistory.btc, btcData.price, "BTC"),
-    calculateMeanReversionSignal(priceHistory.btc, btcData.price, "BTC"),
-  ];
-
-  // Step 4: Aggregate signals per asset
-  runtime.log("\n[Step 3] Signal Analysis:");
+  // Aggregate signals per asset
+  runtime.log("[Step 2] Signal Analysis:");
   for (const signal of signals) {
     runtime.log(
       `  ${signal.asset} ${signal.type}: ${signal.signal} (${(signal.strength * 100).toFixed(1)}%) - ${signal.reason}`
     );
   }
 
-  // AI agent decision summary
-  const ethSignals = signals.filter((s) => s.asset === "ETH");
-  const btcSignals = signals.filter((s) => s.asset === "BTC");
+  const aggregated = aggregateSignals(signals);
 
-  const ethBuyStrength =
-    ethSignals
-      .filter((s) => s.signal === "BUY")
-      .reduce((sum, s) => sum + s.strength, 0) / ethSignals.length;
-  const ethSellStrength =
-    ethSignals
-      .filter((s) => s.signal === "SELL")
-      .reduce((sum, s) => sum + s.strength, 0) / ethSignals.length;
-
-  const btcBuyStrength =
-    btcSignals
-      .filter((s) => s.signal === "BUY")
-      .reduce((sum, s) => sum + s.strength, 0) / btcSignals.length;
-  const btcSellStrength =
-    btcSignals
-      .filter((s) => s.signal === "SELL")
-      .reduce((sum, s) => sum + s.strength, 0) / btcSignals.length;
+  // Use block-derived timestamp for deterministic consensus across nodes
+  const timestamp = Math.floor(Number((_triggerOutput as any).timestamp ?? 0));
 
   const result = {
     timestamp,
-    prices: {
-      ETH: ethData.price,
-      BTC: btcData.price,
-    },
+    prices,
     signals,
-    aggregated: {
-      ETH: {
-        buyStrength: ethBuyStrength,
-        sellStrength: ethSellStrength,
-        recommendation:
-          ethBuyStrength > 0.3
-            ? "BUY"
-            : ethSellStrength > 0.3
-              ? "SELL"
-              : "HOLD",
-      },
-      BTC: {
-        buyStrength: btcBuyStrength,
-        sellStrength: btcSellStrength,
-        recommendation:
-          btcBuyStrength > 0.3
-            ? "BUY"
-            : btcSellStrength > 0.3
-              ? "SELL"
-              : "HOLD",
-      },
-    },
+    aggregated,
   };
 
-  runtime.log(`\n[Step 4] Recommendations:`);
-  runtime.log(`  ETH: ${result.aggregated.ETH.recommendation}`);
-  runtime.log(`  BTC: ${result.aggregated.BTC.recommendation}`);
-  runtime.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+  runtime.log(`[Step 3] Recommendations:`);
+  for (const [asset, agg] of Object.entries(aggregated)) {
+    runtime.log(`  ${asset}: ${agg.recommendation}`);
+  }
 
   return JSON.stringify(result);
 };
@@ -374,27 +358,34 @@ const onHttpTrigger = (
   runtime: Runtime<WorkflowConfig>,
   payload: HTTPPayload
 ): string => {
-  runtime.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   runtime.log("AgentTrade CRE Workflow: HTTP Trigger (Agent Request)");
-  runtime.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-  // Parse request if present
-  let requestedAssets = ["ETH", "BTC"];
+  const evmConfig = runtime.config.evms[0];
+  const availableAssets = Object.keys(evmConfig.dataFeeds);
+
+  // Parse request - filter to only configured assets
+  let requestedAssets = availableAssets;
   if (payload.input && payload.input.length > 0) {
     try {
       const input = decodeJson(payload.input);
       if (input.assets && Array.isArray(input.assets)) {
-        requestedAssets = input.assets;
+        requestedAssets = input.assets.filter((a: string) =>
+          availableAssets.includes(a)
+        );
+        if (requestedAssets.length === 0) {
+          return JSON.stringify({
+            error: `No valid assets requested. Available: ${availableAssets.join(", ")}`,
+          });
+        }
       }
     } catch {
       // Use defaults
     }
   }
 
-  // Re-use the same price fetching logic
   const network = getNetwork({
     chainFamily: "evm",
-    chainSelectorName: runtime.config.evms[0].chainSelectorName,
+    chainSelectorName: evmConfig.chainSelectorName,
     isTestnet: true,
   });
 
@@ -410,34 +401,26 @@ const onHttpTrigger = (
   const signals: TradingSignal[] = [];
 
   for (const asset of requestedAssets) {
-    const feedAddress =
-      runtime.config.evms[0].dataFeeds[
-        asset as keyof typeof runtime.config.evms[0]["dataFeeds"]
-      ];
+    const feedAddress = evmConfig.dataFeeds[asset];
     if (!feedAddress) continue;
 
     const data = getPriceFromFeed(runtime, evmClient, feedAddress);
     prices[asset] = data.price;
 
-    const history =
-      asset === "ETH"
-        ? priceHistory.eth
-        : asset === "BTC"
-          ? priceHistory.btc
-          : [];
-
+    // Same note as cron: no persistent history in CRE
     signals.push(
-      calculateMomentumSignal(history, data.price, asset),
-      calculateMeanReversionSignal(history, data.price, asset)
+      calculateMomentumSignal([], data.price, asset),
+      calculateMeanReversionSignal([], data.price, asset)
     );
   }
 
   runtime.log(`Returning signals for: ${requestedAssets.join(", ")}`);
 
   return JSON.stringify({
-    timestamp: Math.floor(Date.now() / 1000),
+    timestamp: Number((payload as any).timestamp ?? 0),
     prices,
     signals,
+    aggregated: aggregateSignals(signals),
   });
 };
 
@@ -459,7 +442,7 @@ const initWorkflow = (config: WorkflowConfig) => {
         authorizedKeys: [
           {
             type: "KEY_TYPE_ECDSA_EVM",
-            publicKey: "", // Set via config in production
+            publicKey: "", // Set via config/env in production
           },
         ],
       }),
@@ -473,4 +456,7 @@ export async function main() {
   await runner.run(initWorkflow);
 }
 
-main();
+// Only run when executed directly, not when imported
+if (typeof process !== "undefined" && process.argv[1]?.includes("workflow")) {
+  main();
+}

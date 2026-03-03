@@ -4,11 +4,13 @@
   "description": "AgentTrade - AI agents consume CRE-powered trading signals via x402 payments",
   "type": "module",
   "scripts": {
-    "simulate": "node scripts/simulate.js",
+    "simulate": "npx tsx scripts/simulate.ts",
     "deploy": "node scripts/deploy.js",
     "agent": "npx tsx src/agent/index.ts",
     "server": "npx tsx server/src/server.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [
     "chainlink",
@@ -30,6 +32,7 @@
     "@types/express": "^4.17.25",
     "@types/node": "^22.19.13",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
   }
 }
