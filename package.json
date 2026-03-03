@@ -1,0 +1,35 @@
+{
+  "name": "agenttrade-cre",
+  "version": "1.0.0",
+  "description": "AgentTrade - AI agents consume CRE-powered trading signals via x402 payments",
+  "type": "module",
+  "scripts": {
+    "simulate": "node scripts/simulate.js",
+    "deploy": "node scripts/deploy.js",
+    "agent": "npx tsx src/agent/index.ts",
+    "server": "npx tsx server/src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "chainlink",
+    "cre",
+    "ai",
+    "x402",
+    "trading",
+    "defi",
+    "hackathon"
+  ],
+  "dependencies": {
+    "@chainlink/cre-sdk": "latest",
+    "cors": "^2.8.6",
+    "express": "^4.22.1",
+    "viem": "^2.21.54"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.25",
+    "@types/node": "^22.19.13",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

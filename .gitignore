@@ -1,0 +1,28 @@
+# Environment
+.env
+*.env
+!.env.example
+
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build
+dist/
+build/
+
+# Config with secrets
+config.staging.json
+config.production.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+.env
+node_modules/
