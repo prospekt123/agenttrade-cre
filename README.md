@@ -1,5 +1,8 @@
 # AgentTrade - AI Agents Consuming CRE Trading Signals via x402 Payments
 
+> 📹 [**Demo Video**](https://github.com/prospekt123/agenttrade-cre/releases/download/v1.0-demo/agenttrade-demo.mp4)
+
+
 > **Submission for Chainlink Convergence Hackathon 2026 - CRE & AI Track**
 
 AgentTrade demonstrates how **AI trading agents can consume Chainlink CRE workflows via x402 micropayments**. The system uses CRE to orchestrate real-time price analysis from Chainlink Data Feeds, generates AI-powered trading signals, and exposes them through an x402-gated API that any AI agent can pay to access.
